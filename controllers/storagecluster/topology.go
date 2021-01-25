@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/openshift/ocs-operator/controllers/defaults"
+	utils "github.com/openshift/ocs-operator/controllers/util"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
@@ -38,27 +39,62 @@ func (r *StorageClusterReconciler) getStorageClusterEligibleNodes(sc *ocsv1.Stor
 	return nodes, err
 }
 
-// determineFailureDomain determines the appropriate Ceph failure domain based
-// on the storage cluster's topology map
-func determineFailureDomain(sc *ocsv1.StorageCluster) string {
+type failureDomain struct {
+	Type   string
+	Key    string
+	Values []string
+}
+
+// determineFailureDomain determines the appropriate Ceph failure domain type,
+// key and values based on the storage cluster's topology map
+func (r *StorageClusterReconciler) determineFailureDomain(sc *ocsv1.StorageCluster) (failureDomain failureDomain, err error) {
+
+	minNodes := getMinimumNodes(sc)
+
+	nodes, err := r.getStorageClusterEligibleNodes(sc)
+	if err != nil {
+		return failureDomain, fmt.Errorf("Failed to get storage cluster eligible nodes: %v", err)
+	}
+
+	if sc.Status.NodeTopologies == nil || sc.Status.NodeTopologies.Labels == nil {
+		err := r.reconcileNodeTopologyMap(sc, minNodes, nodes)
+		if err != nil {
+			return failureDomain, fmt.Errorf("Failed to reconcile node topology: %v", err)
+		}
+	}
+
+	filterDeprecatedLabels(sc.Status.NodeTopologies)
+
 	if sc.Status.FailureDomain != "" {
-		return sc.Status.FailureDomain
+		failureDomain.Type = sc.Status.FailureDomain
+		failureDomain.Key, failureDomain.Values = sc.Status.NodeTopologies.GetKeyValues(failureDomain.Type)
+		return failureDomain, nil
 	}
 
 	if sc.Spec.FlexibleScaling {
-		return "host"
+		failureDomain.Type = "host"
+		failureDomain.Key, failureDomain.Values = sc.Status.NodeTopologies.GetKeyValues(failureDomain.Type)
+		return failureDomain, nil
 	}
 
-	topologyMap := sc.Status.NodeTopologies
-	failureDomain := "rack"
-	for label, labelValues := range topologyMap.Labels {
+	for label, labelValues := range sc.Status.NodeTopologies.Labels {
 		if strings.Contains(label, "zone") {
 			if (len(labelValues) >= 2 && arbiterEnabled(sc)) || (len(labelValues) >= 3) {
-				failureDomain = "zone"
+				failureDomain.Type = "zone"
+				failureDomain.Key, failureDomain.Values = sc.Status.NodeTopologies.GetKeyValues(failureDomain.Type)
+				return failureDomain, nil
 			}
 		}
 	}
-	return failureDomain
+
+	// Default to rack failure domain if no other failure domain available
+	err = r.ensureNodeRacks(nodes, minNodes, sc.Status.NodeTopologies)
+	if err != nil {
+		return failureDomain, fmt.Errorf("Unable to assign rack labels: %v", err)
+	}
+	failureDomain.Type = "rack"
+	failureDomain.Key, failureDomain.Values = sc.Status.NodeTopologies.GetKeyValues(failureDomain.Type)
+	return failureDomain, nil
 }
 
 // determinePlacementRack sorts the list of known racks in alphabetical order,
@@ -172,7 +208,21 @@ func generateStrategicPatch(oldObj, newObj interface{}) (client.Patch, error) {
 // all nodes have a rack topology label.
 func (r *StorageClusterReconciler) ensureNodeRacks(
 	nodes *corev1.NodeList, minRacks int,
-	nodeRacks, topologyMap *ocsv1.NodeTopologyMap) error {
+	topologyMap *ocsv1.NodeTopologyMap) error {
+
+	nodeRacks := ocsv1.NewNodeTopologyMap()
+
+	for _, node := range nodes.Items {
+		labels := node.Labels
+		for label, value := range labels {
+			if strings.Contains(label, "rack") {
+				if !nodeRacks.Contains(value, node.Name) {
+					nodeRacks.Add(value, node.Name)
+				}
+			}
+		}
+
+	}
 
 	for _, node := range nodes.Items {
 		hasRack := false
@@ -216,25 +266,12 @@ func (r *StorageClusterReconciler) ensureNodeRacks(
 
 // reconcileNodeTopologyMap builds the map of all topology labels on all nodes
 // in the storage cluster
-func (r *StorageClusterReconciler) reconcileNodeTopologyMap(sc *ocsv1.StorageCluster) error {
-	minNodes := getMinimumNodes(sc)
-
-	for _, deviceSet := range sc.Spec.StorageDeviceSets {
-		if deviceSet.Replica > minNodes {
-			minNodes = deviceSet.Replica
-		}
-	}
-
-	nodes, err := r.getStorageClusterEligibleNodes(sc)
-	if err != nil {
-		return err
-	}
+func (r *StorageClusterReconciler) reconcileNodeTopologyMap(sc *ocsv1.StorageCluster, minNodes int, nodes *corev1.NodeList) error {
 
 	if sc.Status.NodeTopologies == nil || sc.Status.NodeTopologies.Labels == nil {
 		sc.Status.NodeTopologies = ocsv1.NewNodeTopologyMap()
 	}
 	topologyMap := sc.Status.NodeTopologies
-	nodeRacks := ocsv1.NewNodeTopologyMap()
 
 	r.nodeCount = len(nodes.Items)
 
@@ -253,21 +290,36 @@ func (r *StorageClusterReconciler) reconcileNodeTopologyMap(sc *ocsv1.StorageClu
 					}
 				}
 			}
-			if strings.Contains(label, "rack") {
-				if !nodeRacks.Contains(value, node.Name) {
-					nodeRacks.Add(value, node.Name)
-				}
-			}
+
 		}
 
-	}
-
-	if determineFailureDomain(sc) == "rack" {
-		err = r.ensureNodeRacks(nodes, minNodes, nodeRacks, topologyMap)
-		if err != nil {
-			return err
-		}
 	}
 
 	return nil
+}
+
+// filterDeprecatedLabels will remove the old labels from the TopologyMap if the list of values completely match with the list of values of the new label.
+func filterDeprecatedLabels(topologyMap *ocsv1.NodeTopologyMap) {
+
+	sort.Strings(topologyMap.Labels["failure-domain.beta.kubernetes.io/zone"])
+	sort.Strings(topologyMap.Labels["failure-domain.kubernetes.io/zone"])
+	sort.Strings(topologyMap.Labels["topology.kubernetes.io/zone"])
+	sort.Strings(topologyMap.Labels["failure-domain.beta.kubernetes.io/region"])
+	sort.Strings(topologyMap.Labels["failure-domain.kubernetes.io/region"])
+	sort.Strings(topologyMap.Labels["topology.kubernetes.io/region"])
+
+	if utils.CompareStringSlices(topologyMap.Labels["failure-domain.beta.kubernetes.io/zone"], topologyMap.Labels["topology.kubernetes.io/zone"]) {
+		delete(topologyMap.Labels, "failure-domain.beta.kubernetes.io/zone")
+	}
+	if utils.CompareStringSlices(topologyMap.Labels["failure-domain.beta.kubernetes.io/region"], topologyMap.Labels["topology.kubernetes.io/region"]) {
+		delete(topologyMap.Labels, "failure-domain.beta.kubernetes.io/region")
+	}
+
+	if utils.CompareStringSlices(topologyMap.Labels["failure-domain.kubernetes.io/zone"], topologyMap.Labels["topology.kubernetes.io/zone"]) {
+		delete(topologyMap.Labels, "failure-domain.kubernetes.io/zone")
+	}
+	if utils.CompareStringSlices(topologyMap.Labels["failure-domain.kubernetes.io/region"], topologyMap.Labels["topology.kubernetes.io/region"]) {
+		delete(topologyMap.Labels, "failure-domain.kubernetes.io/region")
+	}
+
 }

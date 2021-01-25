@@ -427,7 +427,14 @@ func getMinimumNodes(sc *ocsv1.StorageCluster) int {
 	// needs to override this assumption, we can provide a flag (like
 	// allowReplicasOnSameNode) in the future.
 
-	return getMinDeviceSetReplica(sc) * getReplicasPerFailureDomain(sc)
+	maxReplica := getMinDeviceSetReplica(sc)
+	for _, deviceSet := range sc.Spec.StorageDeviceSets {
+		if deviceSet.Replica > maxReplica {
+			maxReplica = deviceSet.Replica
+		}
+	}
+
+	return maxReplica * getReplicasPerFailureDomain(sc)
 }
 
 func getMonCount(nodeCount int, arbiter bool) int {
@@ -451,7 +458,6 @@ func getMonCount(nodeCount int, arbiter bool) int {
 // newStorageClassDeviceSets converts a list of StorageDeviceSets into a list of Rook StorageClassDeviceSets
 func newStorageClassDeviceSets(sc *ocsv1.StorageCluster, serverVersion *version.Info) []rook.StorageClassDeviceSet {
 	storageDeviceSets := sc.Spec.StorageDeviceSets
-	topologyMap := sc.Status.NodeTopologies
 
 	var storageClassDeviceSets []rook.StorageClassDeviceSet
 
@@ -467,6 +473,7 @@ func newStorageClassDeviceSets(sc *ocsv1.StorageCluster, serverVersion *version.
 
 		portable := ds.Portable
 
+		topologyType := ""
 		topologyKey := ds.TopologyKey
 		topologyKeyValues := []string{}
 
@@ -480,15 +487,14 @@ func newStorageClassDeviceSets(sc *ocsv1.StorageCluster, serverVersion *version.
 
 		if noPlacement {
 			if topologyKey == "" {
-				topologyKey = determineFailureDomain(sc)
+				fd := r.determineFailureDomain(sc)
+				topologyType = fd.Type
+				topologyKey = fd.Key
+				topologyKeyValues = fd.Values
 			}
 
-			if topologyKey == "host" {
+			if topologyType == "host" {
 				portable = false
-			}
-
-			if topologyMap != nil {
-				topologyKey, topologyKeyValues = topologyMap.GetKeyValues(topologyKey)
 			}
 		}
 
@@ -664,7 +670,10 @@ func allowUnsupportedCephVersion() bool {
 func generateStretchClusterSpec(sc *ocsv1.StorageCluster) *cephv1.StretchClusterSpec {
 	var zones []string
 	stretchClusterSpec := cephv1.StretchClusterSpec{}
-	stretchClusterSpec.FailureDomainLabel, zones = sc.Status.NodeTopologies.GetKeyValues(determineFailureDomain(sc))
+
+	fd := determineFailureDomain(sc)
+	stretchClusterSpec.FailureDomainLabel = fd.Key
+	zones = fd.Values
 
 	for _, zone := range zones {
 		if zone == sc.Spec.NodeTopologies.ArbiterLocation {
